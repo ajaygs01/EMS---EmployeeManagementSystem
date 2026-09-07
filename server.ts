@@ -2,7 +2,6 @@ import express from "express";
 import path from "path";
 import cors from "cors";
 import dotenv from "dotenv";
-import { createServer as createViteServer } from "vite";
 import { initDatabase, getDatabaseStatus, isMongoConnected } from "./server/db.js";
 import authRoutes from "./server/routes/auth.js";
 import employeeRoutes from "./server/routes/employees.js";
@@ -29,13 +28,18 @@ dotenv.config();
 
 const app = express();
 const PORT = 3000;
+
 let isInitialized = false;
 let initPromise: Promise<void> | null = null;
 
 export async function ensureDatabaseReady(): Promise<void> {
-  if (isInitialized && (process.env.NODE_ENV !== "production" || isMongoConnected())) {
+  if (
+    isInitialized &&
+    (process.env.NODE_ENV !== "production" || isMongoConnected())
+  ) {
     return;
   }
+
   if (!initPromise) {
     initPromise = initDatabase()
       .then(() => {
@@ -43,19 +47,37 @@ export async function ensureDatabaseReady(): Promise<void> {
       })
       .catch((err) => {
         isInitialized = false;
-        initPromise = null; // Allow retry on subsequent requests
+        initPromise = null;
         throw err;
       });
   }
+
   return initPromise;
 }
 
+// --------------------------------------------------
 // Middleware
-app.use(cors());
-app.use(express.json({ limit: "15mb" }));
-app.use(express.urlencoded({ extended: true, limit: "15mb" }));
+// --------------------------------------------------
 
-// Diagnostic & Health Route
+app.use(cors());
+
+app.use(
+  express.json({
+    limit: "15mb",
+  })
+);
+
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: "15mb",
+  })
+);
+
+// --------------------------------------------------
+// Health Check
+// --------------------------------------------------
+
 app.get("/api/health", (req, res) => {
   const dbStatus = getDatabaseStatus();
   const isProd = process.env.NODE_ENV === "production";
@@ -66,21 +88,25 @@ app.get("/api/health", (req, res) => {
       app: "EMS - Employee Management System",
       timestamp: new Date().toISOString(),
       database: dbStatus,
-      message: "Database connection unavailable in production. In-memory fallback is strictly disabled to prevent temporary writes and data loss."
+      message:
+        "Database connection unavailable in production. In-memory fallback is strictly disabled to prevent temporary writes and data loss.",
     });
   }
 
-  res.status(200).json({
+  return res.status(200).json({
     status: dbStatus.connected ? "ok" : "degraded",
     app: "EMS - Employee Management System",
     timestamp: new Date().toISOString(),
-    database: dbStatus
+    database: dbStatus,
   });
 });
 
-// Ensure database is initialized before serving any API route
+// --------------------------------------------------
+// Database Initialization Middleware
+// --------------------------------------------------
+
 app.use("/api", async (req, res, next) => {
-  // Allow health checks to be evaluated directly
+  // Health endpoint does not require database initialization
   if (req.path === "/health") {
     return next();
   }
@@ -90,13 +116,14 @@ app.use("/api", async (req, res, next) => {
   try {
     await ensureDatabaseReady();
 
-    // In production, strictly enforce that MongoDB is connected
+    // In production, MongoDB must be connected
     if (isProd && !isMongoConnected()) {
       return res.status(503).json({
         success: false,
         error: "DATABASE_UNAVAILABLE",
-        message: "Production database connection is offline. In-memory fallback is disabled in production to avoid temporary writes and data loss.",
-        database: getDatabaseStatus()
+        message:
+          "Production database connection is offline. In-memory fallback is disabled in production to avoid temporary writes and data loss.",
+        database: getDatabaseStatus(),
       });
     }
 
@@ -104,16 +131,25 @@ app.use("/api", async (req, res, next) => {
   } catch (err: any) {
     return res.status(503).json({
       success: false,
-      error: isProd ? "PRODUCTION_DATABASE_ERROR" : "DATABASE_INITIALIZING",
+      error: isProd
+        ? "PRODUCTION_DATABASE_ERROR"
+        : "DATABASE_INITIALIZING",
       message: isProd
-        ? `Production database error: ${err.message || "Database connection failed"}. In-memory fallback is disabled in production to prevent temporary writes.`
-        : `Database initialization in progress: ${err.message || "Please retry shortly."}`,
-      database: getDatabaseStatus()
+        ? `Production database error: ${
+            err.message || "Database connection failed"
+          }. In-memory fallback is disabled in production to prevent temporary writes.`
+        : `Database initialization in progress: ${
+            err.message || "Please retry shortly."
+          }`,
+      database: getDatabaseStatus(),
     });
   }
 });
 
-// Mount API Routes
+// --------------------------------------------------
+// API Routes
+// --------------------------------------------------
+
 app.use("/api/auth", authRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/employees", employeeRoutes);
@@ -135,56 +171,112 @@ app.use("/api/settings", settingRoutes);
 app.use("/api/search", searchRoutes);
 app.use("/api/audit-logs", auditLogRoutes);
 
-// Catch-all for any unhandled /api/* endpoint so it NEVER falls through to Vite HTML!
+// --------------------------------------------------
+// API 404 Handler
+// --------------------------------------------------
+
 app.all("/api/*", (req, res) => {
-  res.status(404).json({
+  return res.status(404).json({
     success: false,
-    message: `API endpoint not found: ${req.method} ${req.originalUrl}`
+    message: `API endpoint not found: ${req.method} ${req.originalUrl}`,
   });
 });
 
+// --------------------------------------------------
 // Global Error Handler
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  console.error("API Error:", err);
-  res.status(err.status || 500).json({
-    success: false,
-    message: err.message || "Internal server error",
-    error: process.env.NODE_ENV === "development" ? err.stack : undefined
-  });
-});
+// --------------------------------------------------
+
+app.use(
+  (
+    err: any,
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
+    console.error("API Error:", err);
+
+    return res.status(err.status || 500).json({
+      success: false,
+      message: err.message || "Internal server error",
+      error:
+        process.env.NODE_ENV === "development" ? err.stack : undefined,
+    });
+  }
+);
+
+// --------------------------------------------------
+// Server Startup
+// --------------------------------------------------
 
 async function startServer() {
   try {
     await ensureDatabaseReady();
   } catch (err: any) {
-    console.error("[Server Startup Notice] Database initialization failed:", err.message);
+    console.error(
+      "[Server Startup Notice] Database initialization failed:",
+      err.message
+    );
+
     if (process.env.NODE_ENV === "production") {
-      console.error("[Production Safe Mode] Server running in fail-safe mode. Production writes and operations are halted until MongoDB connection is restored.");
+      console.error(
+        "[Production Safe Mode] Server running in fail-safe mode. Production writes and operations are halted until MongoDB connection is restored."
+      );
     }
   }
 
-  // Vite middleware for development / static files for production
+  // ------------------------------------------------
+  // Development
+  // ------------------------------------------------
+  // Vite is dynamically imported ONLY in development.
+  // This prevents Vercel production functions from
+  // loading Vite/Rollup and its platform-specific
+  // native dependencies.
+  // ------------------------------------------------
+
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
+
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+      },
       appType: "spa",
     });
+
     app.use(vite.middlewares);
   } else {
+    // ------------------------------------------------
+    // Production
+    // ------------------------------------------------
+
     const distPath = path.join(process.cwd(), "dist");
+
     app.use(express.static(distPath));
+
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  // Only bind port if not running in serverless Vercel function or test mode
+  // ------------------------------------------------
+  // Local Server
+  // ------------------------------------------------
+
+  // Vercel provides its own serverless runtime,
+  // therefore app.listen() must NOT run on Vercel.
+
   if (!process.env.VERCEL && !process.env.TEST_ENV) {
     app.listen(PORT, "0.0.0.0", () => {
-      console.log(`EMS Server successfully running on http://localhost:${PORT}`);
+      console.log(
+        `EMS Server successfully running on http://localhost:${PORT}`
+      );
     });
   }
 }
+
+// --------------------------------------------------
+// Start only when running locally
+// --------------------------------------------------
 
 if (!process.env.VERCEL && !process.env.TEST_ENV) {
   startServer().catch((err) => {
@@ -192,5 +284,8 @@ if (!process.env.VERCEL && !process.env.TEST_ENV) {
   });
 }
 
-export default app;
+// --------------------------------------------------
+// Export Express App for Vercel
+// --------------------------------------------------
 
+export default app;
